@@ -137,6 +137,9 @@ class MLXServer:
                 
                 await self.engine.load_model(request.model_name)
                 
+                # Update the config with the loaded model name
+                self.config.model_name = request.model_name
+                
                 return {
                     "status": "success",
                     "model_name": request.model_name,
@@ -331,25 +334,96 @@ class MLXServer:
     
     async def _wait_for_completion(self, request_id: str) -> Dict[str, Any]:
         """Wait for a request to complete."""
-        # This is a simplified implementation
-        # In practice, you'd track requests and their outputs
-        await asyncio.sleep(0.1)  # Simulate processing time
+        # Wait for the engine to process the request
+        max_wait_time = 30.0  # Maximum wait time in seconds
+        start_time = time.time()
         
+        while time.time() - start_time < max_wait_time:
+            finished_groups = await self.engine.step()
+            
+            # Find our request in finished groups
+            for group in finished_groups:
+                if group.request_id == request_id:
+                    seq = group.sequences[0]
+                    
+                    # Decode the output tokens
+                    if seq.output_token_ids:
+                        output_text = self.engine.model.tokenizer.decode(seq.output_token_ids)
+                    else:
+                        output_text = ""
+                    
+                    return {
+                        "text": output_text,
+                        "prompt_tokens": seq.get_prompt_len(),
+                        "completion_tokens": seq.get_output_len(),
+                        "total_tokens": seq.get_len(),
+                    }
+            
+            await asyncio.sleep(0.01)  # Small delay
+        
+        # Timeout fallback
         return {
-            "text": "This is a placeholder response.",
-            "prompt_tokens": 10,
-            "completion_tokens": 6,
-            "total_tokens": 16,
+            "text": "Request timed out",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
         }
     
     async def _stream_tokens(self, request_id: str) -> AsyncGenerator[str, None]:
         """Stream tokens for a request."""
-        # This is a simplified implementation
-        tokens = ["This", " is", " a", " placeholder", " response", "."]
+        last_output_len = 0
+        max_wait_time = 30.0  # Maximum wait time in seconds
+        start_time = time.time()
         
-        for token in tokens:
-            await asyncio.sleep(0.1)  # Simulate generation time
-            yield token
+        while time.time() - start_time < max_wait_time:
+            finished_groups = await self.engine.step()
+            
+            # Find our request in running sequences
+            found_request = False
+            for group in self.engine.scheduler.running:
+                if group.request_id == request_id:
+                    found_request = True
+                    seq = group.sequences[0]
+                    current_len = seq.get_output_len()
+                    
+                    # Yield new tokens
+                    if current_len > last_output_len:
+                        new_tokens = seq.output_token_ids[last_output_len:current_len]
+                        for token_id in new_tokens:
+                            try:
+                                token_text = self.engine.model.tokenizer.decode([token_id])
+                                yield token_text
+                            except Exception:
+                                yield f"[{token_id}]"  # Fallback for decode errors
+                        last_output_len = current_len
+                    
+                    # Check if finished
+                    if seq.is_finished():
+                        return
+                    break
+            
+            # Check if request finished
+            for group in finished_groups:
+                if group.request_id == request_id:
+                    seq = group.sequences[0]
+                    current_len = seq.get_output_len()
+                    
+                    # Yield any remaining tokens
+                    if current_len > last_output_len:
+                        new_tokens = seq.output_token_ids[last_output_len:current_len]
+                        for token_id in new_tokens:
+                            try:
+                                token_text = self.engine.model.tokenizer.decode([token_id])
+                                yield token_text
+                            except Exception:
+                                yield f"[{token_id}]"
+                    return
+            
+            # If request not found and not in finished, it might be waiting
+            if not found_request:
+                await asyncio.sleep(0.01)
+            else:
+                await asyncio.sleep(0.01)  # Small delay between checks
     
     async def _background_loop(self):
         """Background loop for processing requests."""
@@ -377,21 +451,23 @@ async def run_server(
 ):
     """Run the server."""
     config = EngineConfig(model_name=model_name or "")
-    app = create_app(config)
+    
+    # Create server instance
+    server_instance = MLXServer(config)
     
     # Load model if specified
     if model_name:
-        server = MLXServer(config)
-        server.engine = MLXEngine(config)
-        await server.engine.load_model(model_name)
+        server_instance.engine = MLXEngine(config)
+        await server_instance.engine.load_model(model_name)
+        logger.info(f"Model {model_name} loaded successfully")
     
     # Run server
     config_uvicorn = uvicorn.Config(
-        app,
+        server_instance.app,
         host=host,
         port=port,
         log_level="info",
         **kwargs
     )
-    server = uvicorn.Server(config_uvicorn)
-    await server.serve()
+    uvicorn_server = uvicorn.Server(config_uvicorn)
+    await uvicorn_server.serve()
