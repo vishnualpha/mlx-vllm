@@ -8,7 +8,7 @@ import asyncio
 import logging
 import sys
 from typing import Optional
-
+import os
 from .api.server import run_server
 from .core.types import EngineConfig
 from .models.loader import get_recommended_models
